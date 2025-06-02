@@ -104,6 +104,7 @@
   },
   "registry": "https://registry.npmjs.org/",
   "dependencies": {
-    "lodash.merge": "^4.6.2"
+    "lodash.merge": "^4.6.2",
+    "posthog-node": "^4.17.1"
   }
 }

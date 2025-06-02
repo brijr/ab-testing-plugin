@@ -1,3 +1,4 @@
+import { PostHog } from 'posthog-node'
 import type {
   AfterErrorHook,
   CollectionConfig,
@@ -30,7 +31,9 @@ interface BeforeChangeHookArgs {
 }
 
 // Define the hook type
-type BeforeChangeHook = (args: BeforeChangeHookArgs) => Promise<Record<string, unknown>>
+type BeforeChangeHook = (
+  args: BeforeChangeHookArgs,
+) => Promise<Record<string, unknown> | void> // Allow void for async operations
 
 // Define hooks type
 interface Hooks {
@@ -403,7 +406,10 @@ export const abTestingPlugin =
       }
 
       // Add the hook for this specific collection
-      const copyToVariantHook: BeforeChangeHook = (args: BeforeChangeHookArgs) => {
+      const copyToVariantHook: BeforeChangeHook = async (
+        args: BeforeChangeHookArgs,
+      ): Promise<Record<string, unknown>> => {
+        let posthogClient: PostHog | undefined
         try {
           console.log(`[A/B Plugin] copyToVariantHook fired for ${collectionSlug}`, {
             enableABTesting: args.data.enableABTesting,
@@ -417,145 +423,213 @@ export const abTestingPlugin =
             data.abVariant = {}
           }
 
-          // If A/B testing is disabled, clear the variant data and exit early
-          if (!data.enableABTesting) {
-            data.abVariant = {}
-            return Promise.resolve(data)
-          }
-
-          // Check if this is the first time A/B testing is being enabled
+          const { data, originalDoc } = args
           const wasABTestingEnabled = originalDoc?.enableABTesting === true
           const isABTestingEnabled = data.enableABTesting === true
-          const isFirstTimeEnabling = isABTestingEnabled && !wasABTestingEnabled
 
-          // Only copy content if this is the first time enabling A/B testing
-          if (isFirstTimeEnabling) {
-            console.log(
-              `[A/B Plugin] First time enabling A/B testing for ${collectionSlug}, copying content to variant`,
-            )
-
-            // Get the explicitly defined fields to copy from the collection config
-            const fieldsToCopy = collectionFieldMappings[collectionSlug] || []
-            console.log(`[A/B Plugin] fieldsToCopy for ${collectionSlug}:`, fieldsToCopy)
-
-            // Create a new object for the variant instead of modifying the existing one
-            const newVariant: Record<string, unknown> = {}
-
-            // Only copy the fields that are explicitly defined in the configuration
-            fieldsToCopy.forEach((fieldName) => {
-              // Determine source value: new data overrides originalDoc
-              const sourceValue =
-                data[fieldName] !== undefined ? data[fieldName] : originalDoc?.[fieldName]
-
-              if (sourceValue !== undefined) {
-                console.log(
-                  `[A/B Plugin] Copying field ${fieldName} to variant:`,
-                  typeof sourceValue === 'object' ? 'Complex object' : sourceValue,
-                )
-
-                // Special handling for blocks and complex fields
-                if (
-                  fieldName === 'content' ||
-                  fieldName === 'callOut' ||
-                  fieldName === 'callToAction' ||
-                  fieldName === 'subTitle' ||
-                  typeof sourceValue === 'object'
-                ) {
-                  console.log(`[A/B Plugin] Special handling for complex field: ${fieldName}`)
-
-                  try {
-                    // For blocks and complex objects, use a more careful approach
-                    // First stringify to break references
-                    const jsonString = JSON.stringify(sourceValue)
-                    let parsed
-
-                    try {
-                      parsed = JSON.parse(jsonString)
-                    } catch (err) {
-                      console.log(`[A/B Plugin] Error parsing JSON for ${fieldName}:`, err)
-                      parsed = sourceValue // Fallback to original
-                    }
-
-                    // If we have blocks, ensure we handle them properly
-                    if (
-                      Array.isArray(parsed) &&
-                      parsed.length > 0 &&
-                      parsed[0] &&
-                      (parsed[0].blockType || parsed[0].type || parsed[0].blockName)
-                    ) {
-                      console.log(`[A/B Plugin] Detected blocks in ${fieldName}, sanitizing...`)
-
-                      // Process each block to remove problematic fields
-                      const sanitizedBlocks = parsed.map((block: any) => {
-                        // 1. Get the original block type.
-                        const type = block.blockType || block.type || block.blockName
-
-                        // 2. Create a copy of the block's content to modify.
-                        //    We will pass this to sanitizeObject.
-                        const blockDataToSanitize = { ...block }
-
-                        // 3. Remove original top-level id, _id from this copy before full sanitization.
-                        //    Also remove the various type designators because we'll add the canonical `blockType` back.
-                        //    sanitizeObject (defined in the outer scope) will handle nested ids.
-                        delete blockDataToSanitize.id
-                        delete blockDataToSanitize._id
-                        delete blockDataToSanitize.blockType // remove if it exists from the data payload
-                        delete blockDataToSanitize.type // remove if it exists from the data payload
-                        delete blockDataToSanitize.blockName // remove if it exists from the data payload
-
-                        // 4. Recursively sanitize all remaining fields in the block data.
-                        const sanitizedInternalFields = sanitizeObject(blockDataToSanitize)
-
-                        // 5. Construct the new block with the correct blockType and sanitized fields.
-                        return {
-                          blockType: type,
-                          ...sanitizedInternalFields,
-                        }
-                      })
-
-                      newVariant[fieldName] = sanitizedBlocks
-                    } else {
-                      // For other complex objects, use the recursive sanitizer
-                      newVariant[fieldName] = sanitizeObject(parsed)
-                    }
-                  } catch (err) {
-                    console.log(`[A/B Plugin] Error processing ${fieldName}:`, err)
-                    // Last resort: try a shallow copy
-                    const shallowCopy = Array.isArray(sourceValue)
-                      ? [...sourceValue]
-                      : { ...sourceValue }
-                    newVariant[fieldName] = sanitizeObject(shallowCopy)
-                  }
-                } else {
-                  // For primitive values, assign directly
-                  newVariant[fieldName] = sourceValue
-                }
-              }
-            })
-
-            // Preserve any PostHog-related fields
-            if (data.abVariant?.posthogVariantName) {
-              newVariant.posthogVariantName = data.abVariant.posthogVariantName
-            }
-
-            if (data.abVariant?.posthogFeatureFlagKey) {
-              newVariant.posthogFeatureFlagKey = data.abVariant.posthogFeatureFlagKey
-            }
-
-            // Replace the entire abVariant object with our new clean one
-            data.abVariant = newVariant
-
-            console.log(`[A/B Plugin] Final variant fields:`, Object.keys(newVariant))
-          } else {
-            console.log(
-              `[A/B Plugin] A/B testing already enabled for ${collectionSlug}, preserving existing variant content`,
-            )
+          // Initialize abVariant if not already present
+          if (!data.abVariant || typeof data.abVariant !== 'object') {
+            data.abVariant = {}
           }
 
-          return Promise.resolve(data)
+          // Logic for enabling A/B testing
+          if (isABTestingEnabled) {
+            const isFirstTimeEnabling = isABTestingEnabled && !wasABTestingEnabled
+            if (isFirstTimeEnabling) {
+              console.log(
+                `[A/B Plugin] First time enabling A/B testing for ${collectionSlug}, copying content to variant`,
+              )
+              const fieldsToCopy = collectionFieldMappings[collectionSlug] || []
+              const newVariant: Record<string, unknown> = {}
+              fieldsToCopy.forEach((fieldName) => {
+                const sourceValue =
+                  data[fieldName] !== undefined ? data[fieldName] : originalDoc?.[fieldName]
+                if (sourceValue !== undefined) {
+                  if (
+                    fieldName === 'content' ||
+                    fieldName === 'callOut' ||
+                    fieldName === 'callToAction' ||
+                    fieldName === 'subTitle' ||
+                    typeof sourceValue === 'object'
+                  ) {
+                    try {
+                      const jsonString = JSON.stringify(sourceValue)
+                      let parsed = JSON.parse(jsonString)
+                      if (
+                        Array.isArray(parsed) &&
+                        parsed.length > 0 &&
+                        parsed[0] &&
+                        (parsed[0].blockType || parsed[0].type || parsed[0].blockName)
+                      ) {
+                        const sanitizedBlocks = parsed.map((block: any) => {
+                          const type = block.blockType || block.type || block.blockName
+                          const blockDataToSanitize = { ...block }
+                          delete blockDataToSanitize.id
+                          delete blockDataToSanitize._id
+                          delete blockDataToSanitize.blockType
+                          delete blockDataToSanitize.type
+                          delete blockDataToSanitize.blockName
+                          const sanitizedInternalFields = sanitizeObject(blockDataToSanitize)
+                          return {
+                            blockType: type,
+                            ...sanitizedInternalFields,
+                          }
+                        })
+                        newVariant[fieldName] = sanitizedBlocks
+                      } else {
+                        newVariant[fieldName] = sanitizeObject(parsed)
+                      }
+                    } catch (err) {
+                      console.log(`[A/B Plugin] Error processing ${fieldName}:`, err)
+                      const shallowCopy = Array.isArray(sourceValue)
+                        ? [...sourceValue]
+                        : { ...sourceValue }
+                      newVariant[fieldName] = sanitizeObject(shallowCopy)
+                    }
+                  } else {
+                    newVariant[fieldName] = sourceValue
+                  }
+                }
+              })
+              if (data.abVariant?.posthogVariantName) {
+                newVariant.posthogVariantName = data.abVariant.posthogVariantName
+              }
+              if (data.abVariant?.posthogFeatureFlagKey) {
+                newVariant.posthogFeatureFlagKey = data.abVariant.posthogFeatureFlagKey
+              }
+              data.abVariant = newVariant
+              console.log(`[A/B Plugin] Final variant fields:`, Object.keys(newVariant))
+            } else {
+              console.log(
+                `[A/B Plugin] A/B testing already enabled for ${collectionSlug}, preserving existing variant content`,
+              )
+            }
+
+            // PostHog: Create or Update Feature Flag
+            if (pluginOptions.posthog?.apiKey) {
+              posthogClient = new PostHog(pluginOptions.posthog.apiKey, {
+                host: pluginOptions.posthog.host || 'https://app.posthog.com',
+              })
+              let featureFlagKey = data.posthogFeatureFlagKey as string | undefined
+
+              if (!featureFlagKey) {
+                // Attempt to get a unique ID for the document.
+                // originalDoc._id is preferred for existing docs, data.id for new docs before save,
+                // and Date.now() as a fallback to ensure uniqueness, though less ideal for lookup.
+                const docId = originalDoc?._id || data.id || Date.now()
+                featureFlagKey = `posthog_ab_${collectionSlug}_${docId}`
+                data.posthogFeatureFlagKey = featureFlagKey // Save generated key
+                console.log(
+                  `[A/B Plugin] Generated PostHog feature flag key: ${featureFlagKey}`,
+                )
+              }
+
+              const featureFlagParams = {
+                key: featureFlagKey,
+                name: `A/B Test: ${collectionSlug} - ${
+                  (originalDoc?.title as string) || (data.title as string) || featureFlagKey
+                }`,
+                active: true,
+                filters: {
+                  groups: [{ properties: [], rollout_percentage: null }],
+                  multivariate: {
+                    variants: [
+                      { key: 'control', name: 'Control', rollout_percentage: 50 },
+                      {
+                        key: (data.posthogVariantName as string) || 'variant',
+                        name: (data.posthogVariantName as string) || 'Variant',
+                        rollout_percentage: 50,
+                      },
+                    ],
+                  },
+                },
+                ensure_persistence: true, // Ensures flag settings are saved
+              }
+
+              try {
+                const existingFlag = await posthogClient.getFeatureFlag(featureFlagKey)
+                if (existingFlag && existingFlag.id) {
+                  console.log(
+                    `[A/B Plugin] Feature flag ${featureFlagKey} already exists. Updating.`,
+                  )
+                  await posthogClient.updateFeatureFlag(existingFlag.id, {
+                    name: featureFlagParams.name, // Update name in case title changed
+                    filters: featureFlagParams.filters,
+                    active: true, // Ensure it's active
+                  })
+                  console.log(`[A/B Plugin] Updated PostHog feature flag: ${featureFlagKey}`)
+                } else {
+                  // This else block might be redundant if getFeatureFlag throws for non-existent flags
+                  await posthogClient.createFeatureFlag(featureFlagParams)
+                  console.log(`[A/B Plugin] Created PostHog feature flag: ${featureFlagKey}`)
+                }
+              } catch (error: any) {
+                if (error.statusCode === 404 || error.message?.includes('404')) {
+                  console.log(
+                    `[A/B Plugin] Feature flag ${featureFlagKey} not found. Creating new flag.`,
+                  )
+                  await posthogClient.createFeatureFlag(featureFlagParams)
+                  console.log(`[A/B Plugin] Created PostHog feature flag: ${featureFlagKey}`)
+                } else {
+                  console.error(
+                    '[A/B Plugin] Error creating/updating PostHog feature flag:',
+                    error.message || error,
+                  )
+                }
+              }
+            } else {
+              console.warn(
+                '[A/B Plugin] PostHog API key not configured. Skipping feature flag creation.',
+              )
+            }
+          } else if (wasABTestingEnabled && !isABTestingEnabled) {
+            // A/B testing is being disabled
+            console.log(`[A/B Plugin] A/B testing disabled for ${collectionSlug}.`)
+            data.abVariant = {} // Clear variant data
+
+            // PostHog: Deactivate Feature Flag
+            if (pluginOptions.posthog?.apiKey && data.posthogFeatureFlagKey) {
+              posthogClient = new PostHog(pluginOptions.posthog.apiKey, {
+                host: pluginOptions.posthog.host || 'https://app.posthog.com',
+              })
+              const featureFlagKey = data.posthogFeatureFlagKey as string
+              try {
+                const existingFlag = await posthogClient.getFeatureFlag(featureFlagKey)
+                if (existingFlag && existingFlag.id) {
+                  console.log(
+                    `[A/B Plugin] Deactivating PostHog feature flag: ${featureFlagKey}`,
+                  )
+                  await posthogClient.updateFeatureFlag(existingFlag.id, { active: false })
+                  console.log(
+                    `[A/B Plugin] Deactivated PostHog feature flag: ${featureFlagKey}`,
+                  )
+                } else {
+                  console.log(
+                    `[A/B Plugin] Feature flag ${featureFlagKey} not found. Cannot deactivate.`,
+                  )
+                }
+              } catch (error: any) {
+                console.error(
+                  '[A/B Plugin] Error deactivating PostHog feature flag:',
+                  error.message || error,
+                )
+              }
+            } else {
+              console.warn(
+                '[A/B Plugin] PostHog API key or feature flag key missing. Skipping feature flag deactivation.',
+              )
+            }
+          }
+
+          return data // Return the modified data
         } catch (error) {
           console.error(`[A/B Plugin] Error in copyToVariantHook for ${collectionSlug}:`, error)
-          return Promise.resolve(args.data)
+          return args.data // Return original data on error
+        } finally {
+          if (posthogClient) {
+            await posthogClient.shutdown()
+            console.log('[A/B Plugin] PostHog client shut down.')
+          }
         }
       }
 
